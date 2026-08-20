@@ -1,3 +1,9 @@
+## 2.4.6-dev.1
+
+- Fixed `Bad state: Cannot add event after closing` escaping as an uncaught async error when a plugin handle is disposed. `JanusPlugin` emitters are fed by sources that outlive `dispose()` — the transport keeps delivering events Janus had already sent for the handle (an AudioBridge/VideoRoom `left` lands a few milliseconds after the `leave` it acknowledged, i.e. right after the caller disposes), and the peer connection keeps reporting candidates, tracks and renegotiations while it closes. Those writes now go through a guard that drops the event when the controller is closed, matching what the data-channel and remote-track emitters already did.
+- `closeStreamControllers()` now cancels the per-handle event pump (`_handleEventMessageEmitter`'s subscription) and cancels the transport subscription *before* closing the controllers those two write into, so a delivery queued at teardown has nowhere left to land.
+- A trickle candidate arriving after its peer connection is gone (handle disposed, or the WebRTC stack rebuilt for an ICE restart) is dropped instead of throwing on a null check.
+
 ## 2.4.5
 
 - Added `janus_ws_meetecho` to `conf.dart` for Google Meet example

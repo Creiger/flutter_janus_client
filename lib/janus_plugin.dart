@@ -525,6 +525,11 @@ class JanusPlugin {
 
   //temporary variables
   StreamSubscription? _wsStreamSubscription;
+
+  /// Subscription of the per-handle event pump set up by
+  /// [_handleEventMessageEmitter]. Held so [closeStreamControllers] can stop the
+  /// pump, instead of leaving it running against controllers it has just closed.
+  StreamSubscription? _pluginEventSubscription;
   late bool pollingActive;
 
   /// Exposes WebRTC statistics helpers (bitrate calculations, history, etc.).
@@ -575,7 +580,7 @@ class JanusPlugin {
     _context._logger.finest('webRTC stack intialized');
     RTCPeerConnection peerConnection = await createPeerConnection(_webRtcConfiguration!, {});
     peerConnection.onRenegotiationNeeded = () {
-      _renegotiationNeededController?.sink.add(true);
+      _emit(_renegotiationNeededController, true);
     };
     //unified plan webrtc tracks emitter
     _handleUnifiedWebRTCTracksEmitter(peerConnection);
@@ -630,9 +635,26 @@ class JanusPlugin {
       });
     } else if (_transport is WebSocketJanusTransport) {
       _wsStreamSubscription = (_transport as WebSocketJanusTransport).stream.listen((event) {
-        _streamController!.add(parse(event));
+        _emit(_streamController, parse(event));
       });
     }
+  }
+
+  /// Sinks [event] into [controller] unless it has already been closed.
+  ///
+  /// Every emitter in this class is driven by something that outlives
+  /// [dispose]: the transport keeps delivering events Janus had already sent for
+  /// this handle (a room's `left` lands a few milliseconds after the `leave` it
+  /// acknowledged, by which time the caller has usually disposed the handle),
+  /// and the peer connection keeps reporting candidates, tracks and
+  /// renegotiations while it closes. Adding to a closed controller throws
+  /// `Bad state: Cannot add event after closing` from inside a stream or WebRTC
+  /// callback, where there is nothing to catch it — it reaches the application
+  /// as an uncaught async error. Dropping the event is the right outcome: the
+  /// handle it belonged to is gone and nobody is listening any more.
+  void _emit<T>(StreamController<T>? controller, T event) {
+    if (controller == null || controller.isClosed) return;
+    controller.add(event);
   }
 
   /// Sets up the broadcast stream controllers used throughout the plugin.
@@ -684,22 +706,22 @@ class JanusPlugin {
             : event.receiver != null
                 ? event.receiver?.track?.id
                 : event.track.id;
-        _remoteTrackStreamController?.add(RemoteTrack(track: event.track, mid: mid, flowing: true));
+        _emit(_remoteTrackStreamController, RemoteTrack(track: event.track, mid: mid, flowing: true));
         event.track.onEnded = () async {
           // Notify the application
-          if (!_remoteTrackStreamController!.isClosed) _remoteTrackStreamController?.add(RemoteTrack(track: event.track, mid: mid, flowing: false));
+          _emit(_remoteTrackStreamController, RemoteTrack(track: event.track, mid: mid, flowing: false));
         };
         event.track.onMute = () async {
-          if (!_remoteTrackStreamController!.isClosed) _remoteTrackStreamController?.add(RemoteTrack(track: event.track, mid: mid, flowing: false));
+          _emit(_remoteTrackStreamController, RemoteTrack(track: event.track, mid: mid, flowing: false));
         };
         event.track.onUnMute = () async {
-          if (!_remoteTrackStreamController!.isClosed) _remoteTrackStreamController?.add(RemoteTrack(track: event.track, mid: mid, flowing: true));
+          _emit(_remoteTrackStreamController, RemoteTrack(track: event.track, mid: mid, flowing: true));
         };
       };
     }
     // source for onRemoteStream
     peerConnection.onAddStream = (mediaStream) {
-      _remoteStreamController!.sink.add(mediaStream);
+      _emit(_remoteStreamController, mediaStream);
     };
   }
 
@@ -721,7 +743,9 @@ class JanusPlugin {
           WebSocketJanusTransport ws = (_transport as WebSocketJanusTransport);
           response = (await ws.send(request, handleId: handleId)) as Map<String, dynamic>;
         }
-        _streamController!.sink.add(response);
+        // The trickle round-trip is awaited above, so the handle can have been
+        // disposed by the time the reply comes back.
+        _emit(_streamController, response);
       }
     };
   }
@@ -729,7 +753,7 @@ class JanusPlugin {
   /// Filters session-level events and emits those that match this handle.
   void _handleEventMessageEmitter() {
     //filter and only send events for current handleId
-    _events.where((event) {
+    _pluginEventSubscription = _events.where((event) {
       Map<String, dynamic> result = event;
       if (result.containsKey('sender')) {
         if ((result['sender'] as int?) == handleId) return true;
@@ -740,10 +764,10 @@ class JanusPlugin {
     }).listen((event) {
       var jsep = event['jsep'];
       if (jsep != null) {
-        _messagesStreamController!.sink.add(EventMessage(event: event, jsep: RTCSessionDescription(jsep['sdp'], jsep['type'])));
+        _emit(_messagesStreamController, EventMessage(event: event, jsep: RTCSessionDescription(jsep['sdp'], jsep['type'])));
       } else {
         _addTrickleCandidate(event);
-        _messagesStreamController!.sink.add(EventMessage(event: event, jsep: null));
+        _emit(_messagesStreamController, EventMessage(event: event, jsep: null));
       }
     });
   }
@@ -753,8 +777,12 @@ class JanusPlugin {
     final isTrickleEvent = event['janus'] == 'trickle';
     if (isTrickleEvent) {
       final candidateMap = event['candidate'];
+      // A trickle can outlive the peer connection it belongs to — the handle may
+      // have been disposed, or the WebRTC stack rebuilt for an ICE restart.
+      final peerConnection = webRTCHandle?.peerConnection;
+      if (peerConnection == null) return;
       RTCIceCandidate candidate = RTCIceCandidate(candidateMap['candidate'], candidateMap['sdpMid'], candidateMap['sdpMLineIndex']);
-      webRTCHandle!.peerConnection!.addCandidate(candidate);
+      peerConnection.addCandidate(candidate);
     }
   }
 
@@ -887,6 +915,13 @@ class JanusPlugin {
   void closeStreamControllers() {
     this.pollingActive = false;
     _pollingTimer?.cancel();
+    // Stop the producers before closing what they write into. Both of these
+    // deliver events Janus had already sent for this handle, and a delivery
+    // queued at this instant is exactly what used to reach a closed controller.
+    _wsStreamSubscription?.cancel();
+    _wsStreamSubscription = null;
+    _pluginEventSubscription?.cancel();
+    _pluginEventSubscription = null;
     _streamController?.close();
     _remoteStreamController?.close();
     _messagesStreamController?.close();
@@ -896,7 +931,6 @@ class JanusPlugin {
     _dataStreamController?.close();
     _onDataStreamController?.close();
     _renegotiationNeededController?.close();
-    _wsStreamSubscription?.cancel();
   }
 
   /// Disposes timers, stream controllers, transports, and media tied to this plugin.
@@ -1143,7 +1177,7 @@ class JanusPlugin {
                   streams: [webRTCHandle!.localStream!], direction: transceiverDirection, sendEncodings: element.kind == 'video' ? simulcastSendEncodings : null));
         });
       } else {
-        _localStreamController!.sink.add(webRTCHandle!.localStream);
+        _emit(_localStreamController, webRTCHandle!.localStream);
         await webRTCHandle!.peerConnection!.addStream(webRTCHandle!.localStream!);
       }
       return webRTCHandle!.localStream;
